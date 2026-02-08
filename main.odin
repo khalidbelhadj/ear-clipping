@@ -12,6 +12,7 @@ import rl "vendor:raylib"
 
 WINDOW_TITLE: cstring = "Triangulation by Ear Clipping "
 LINE_COLOR: rl.Color = FG_COLOR
+LINE_COLOR_DEBUG: rl.Color = rl.ColorAlpha(FG_COLOR, 0.2)
 LINE_THICKNESS: f32 = 1.0
 DASH_LENGTH: f32 = 5.0
 DASH_GAP: f32 = 5.0
@@ -30,6 +31,7 @@ CONFIG_OPTIONS := []cstring {
 	"Reset (R)",
 	"Toggle Triangulation (T)",
 	"Toggle Labels (L)",
+	"Toggle Debug (D)",
 }
 MAX_POINTS :: 1024
 MAX_POLYGONS :: 128
@@ -187,9 +189,14 @@ draw_point :: proc(point: rl.Vector2, is_hovered: bool = false) {
 	}
 }
 
-draw_line :: proc(start: rl.Vector2, end: rl.Vector2, dashed: bool = false) {
+draw_line :: proc(
+	start: rl.Vector2,
+	end: rl.Vector2,
+	dashed: bool = false,
+	color: rl.Color = LINE_COLOR,
+) {
 	if !dashed {
-		rl.DrawLineEx(start, end, LINE_THICKNESS, LINE_COLOR)
+		rl.DrawLineEx(start, end, LINE_THICKNESS, color)
 		return
 	}
 
@@ -214,7 +221,7 @@ draw_line :: proc(start: rl.Vector2, end: rl.Vector2, dashed: bool = false) {
 			start.y + dir.y * (distance + segment_len),
 		}
 
-		rl.DrawLineEx(segment_start, segment_end, LINE_THICKNESS, LINE_COLOR)
+		rl.DrawLineEx(segment_start, segment_end, LINE_THICKNESS, color)
 		distance += DASH_LENGTH + DASH_GAP
 	}
 }
@@ -331,13 +338,15 @@ ear_clipping :: proc(polygon: ^PointList) -> ([dynamic]Triangle, bool) {
 	head := polygon.head
 	triangles := [dynamic]Triangle{}
 	remaining_points := polygon.size
-	visited: u32 = 0
+	no_ear_streak: u32 = 0
 	area := polygon_area(polygon)
 	if area == 0 {
+		log.debug("Polygon has zero area, cannot triangulate.")
 		return [dynamic]Triangle{}, false
 	}
 	is_ccw := area > 0
 	for remaining_points >= 3 {
+		// Get the next and previous points, wrapping around
 		point := head
 		prev := point.prev
 		if prev == nil {
@@ -362,8 +371,8 @@ ear_clipping :: proc(polygon: ^PointList) -> ([dynamic]Triangle, bool) {
 			// Check if any other point is inside the triangle
 			// if so, then this is not an ear
 			is_ear := true
-			it2 := polygon.head
-			for other_point in next_point(&it2) {
+			it := polygon.head
+			for other_point in next_point(&it) {
 				if other_point != prev && other_point != point && other_point != next {
 					if is_in_triangle(triangle, other_point.pos) {
 						is_ear = false
@@ -373,22 +382,31 @@ ear_clipping :: proc(polygon: ^PointList) -> ([dynamic]Triangle, bool) {
 			}
 
 			if is_ear {
+				// If the polygon is counter-clockwise, we need to swap b and c to maintain the correct winding order
 				if !is_ccw {
 					triangle.b, triangle.c = triangle.c, triangle.b
 				}
 				append(&triangles, triangle)
 				point_list_remove(polygon, point)
-				remaining_points -= 1
 				head = next
-				visited = 0
+				remaining_points -= 1
+				no_ear_streak = 0
 				continue
 			}
 		}
 
+		// Not an ear
 		head = next
-		visited += 1
-		if visited >= remaining_points {
-			return [dynamic]Triangle{}, false
+		no_ear_streak += 1
+		if no_ear_streak >= remaining_points {
+			log.debug(
+				"Bug in ear clipping algorithm, visited all remaining points without finding an ear.",
+				"no_ear_streak",
+				no_ear_streak,
+				"remaining",
+				remaining_points,
+			)
+			return triangles, false
 		}
 	}
 
@@ -424,6 +442,7 @@ main :: proc() {
 	rl.SetTargetFPS(120)
 
 	triangulations := [MAX_POLYGONS][dynamic]Triangle{}
+	is_triangulation_invalid := [MAX_POLYGONS]bool{}
 	polygons := [MAX_POLYGONS]PointList{}
 	polygons_size := 0
 	current_polygon := PointList {
@@ -431,10 +450,12 @@ main :: proc() {
 		head = nil,
 		tail = nil,
 	}
-	current_triangles := [dynamic]Triangle{}
+	current_triangulation := [dynamic]Triangle{}
+	is_current_triangulation_invalid := false
 	dragging_point_ref := PointRef{}
 	triangulate := true
 	show_labels := true
+	debug := true
 
 	for !rl.WindowShouldClose() {
 		rl.BeginDrawing()
@@ -446,7 +467,8 @@ main :: proc() {
 		mouse_pos.y = math.clamp(mouse_pos.y, 0, cast(f32)height - POINT_OUTER_RADIUS)
 		hovered_point_ref := PointRef{}
 		is_selecting := false
-		message: cstring = nil
+		message: string = ""
+		message_buffer := [256]byte{}
 
 		// Calculate key bindings panel size
 		panel_font_size := FontSize.SMALL
@@ -554,9 +576,8 @@ main :: proc() {
 				point_list_free(&polygons[i])
 			}
 			polygons_size = 0
-
 			current_polygon = PointList{}
-			current_triangles = [dynamic]Triangle{}
+			current_triangulation = [dynamic]Triangle{}
 		}
 
 		// Close the polygon
@@ -587,6 +608,11 @@ main :: proc() {
 			show_labels = !show_labels
 		}
 
+		// Debug
+		if rl.IsKeyPressed(rl.KeyboardKey.D) {
+			debug = !debug
+		}
+
 		if triangulate {
 			if current_polygon.size >= 3 {
 				temporary_polygon := point_list_clone(&current_polygon)
@@ -596,16 +622,18 @@ main :: proc() {
 
 				triangles, found := ear_clipping(&temporary_polygon)
 				if found {
-					current_triangles = triangles
-					message = nil
+					message = ""
+					is_current_triangulation_invalid = false
+					current_triangulation = triangles
 				} else {
-					log.debug("Failed to triangulate polygon")
+					log.debug("Failed to triangulate polygon", triangles)
 					message = "Failed to triangulate polygon"
-					current_triangles = [dynamic]Triangle{}
+					is_current_triangulation_invalid = true
+					current_triangulation = triangles
 				}
 				point_list_free(&temporary_polygon)
 			} else {
-				current_triangles = [dynamic]Triangle{}
+				current_triangulation = [dynamic]Triangle{}
 			}
 
 			for i in 0 ..< polygons_size {
@@ -613,12 +641,18 @@ main :: proc() {
 				temporary_polygon := point_list_clone(polygon)
 				triangles, found := ear_clipping(&temporary_polygon)
 				if found {
+					message = ""
+					is_triangulation_invalid[i] = false
 					triangulations[i] = triangles
-					message = nil
 				} else {
-					log.debug("Failed to triangulate polygon")
-					message = "Failed to triangulate polygon"
-					triangulations[i] = [dynamic]Triangle{}
+					log.debug("Failed to triangulate polygon ", i + 1)
+					message = fmt.bprintf(
+						message_buffer[:],
+						"Failed to triangulate polygon %d",
+						i + 1,
+					)
+					is_triangulation_invalid[i] = true
+					triangulations[i] = triangles
 				}
 
 				point_list_free(&temporary_polygon)
@@ -695,24 +729,44 @@ main :: proc() {
 
 		// Draw triangles
 		if triangulate {
-			for triangle, i in current_triangles {
+			for triangle, i in current_triangulation {
 				color := colors[i % len(colors)]
 				color = rl.ColorAlpha(color, 0.1)
-				draw_line(triangle.a, triangle.b)
-				draw_line(triangle.a, triangle.c)
-				draw_line(triangle.b, triangle.c)
-				rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
-			}
 
-			for i in 0 ..< polygons_size {
-				triangles := triangulations[i]
-				for triangle, i in triangles {
-					color := colors[i % len(colors)]
-					color = rl.ColorAlpha(color, 0.1)
+				if is_current_triangulation_invalid {
+					if debug {
+						draw_line(triangle.a, triangle.b, true, LINE_COLOR_DEBUG)
+						draw_line(triangle.a, triangle.c, true, LINE_COLOR_DEBUG)
+						draw_line(triangle.b, triangle.c, true, LINE_COLOR_DEBUG)
+						rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
+					}
+				} else {
 					draw_line(triangle.a, triangle.b)
 					draw_line(triangle.a, triangle.c)
 					draw_line(triangle.b, triangle.c)
 					rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
+				}
+			}
+
+			for i in 0 ..< polygons_size {
+				polygon := polygons[i]
+				triangles := triangulations[i]
+				for triangle, i in triangles {
+					color := colors[i % len(colors)]
+					color = rl.ColorAlpha(color, 0.1)
+					if is_triangulation_invalid[i] {
+						if debug {
+							draw_line(triangle.a, triangle.b, true, LINE_COLOR_DEBUG)
+							draw_line(triangle.a, triangle.c, true, LINE_COLOR_DEBUG)
+							draw_line(triangle.b, triangle.c, true, LINE_COLOR_DEBUG)
+							rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
+						}
+					} else {
+						draw_line(triangle.a, triangle.b)
+						draw_line(triangle.a, triangle.c)
+						draw_line(triangle.b, triangle.c)
+						rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
+					}
 				}
 			}
 		}
@@ -764,9 +818,10 @@ main :: proc() {
 			},
 		)
 
-		message_width := measure_text(message).x
+		message_cstring := strings.clone_to_cstring(message)
+		message_width := measure_text(message_cstring).x
 		draw_text(
-			message,
+			message_cstring,
 			rl.Vector2 {
 				(cast(f32)width - message_width) / 2,
 				cast(f32)height - cast(f32)FontSize.SMALL * 2,
