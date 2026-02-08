@@ -288,6 +288,16 @@ point_list_reverse :: proc(list: ^PointList) {
 	list.head, list.tail = list.tail, list.head
 }
 
+point_list_to_slice :: proc(list: PointList) -> [dynamic]rl.Vector2 {
+	result := [dynamic]rl.Vector2{}
+	head := list.head
+	it := &head
+	for point in next_point(it) {
+		append(&result, point.pos)
+	}
+	return result
+}
+
 next_point :: proc(point: ^^Point) -> (^Point, bool) {
 	if point^ == nil {
 		return nil, false
@@ -340,6 +350,7 @@ ear_clipping :: proc(polygon: ^PointList) -> ([dynamic]Triangle, bool) {
 	remaining_points := polygon.size
 	no_ear_streak: u32 = 0
 	area := polygon_area(polygon)
+	points_slice := point_list_to_slice(polygon^)
 	if area == 0 {
 		log.debug("Polygon has zero area, cannot triangulate.")
 		return [dynamic]Triangle{}, false
@@ -371,10 +382,9 @@ ear_clipping :: proc(polygon: ^PointList) -> ([dynamic]Triangle, bool) {
 			// Check if any other point is inside the triangle
 			// if so, then this is not an ear
 			is_ear := true
-			it := polygon.head
-			for other_point in next_point(&it) {
-				if other_point != prev && other_point != point && other_point != next {
-					if is_in_triangle(triangle, other_point.pos) {
+			for other_point in points_slice {
+				if other_point != prev.pos && other_point != point.pos && other_point != next.pos {
+					if is_in_triangle(triangle, other_point) {
 						is_ear = false
 						break
 					}
@@ -399,13 +409,6 @@ ear_clipping :: proc(polygon: ^PointList) -> ([dynamic]Triangle, bool) {
 		head = next
 		no_ear_streak += 1
 		if no_ear_streak >= remaining_points {
-			log.debug(
-				"Bug in ear clipping algorithm, visited all remaining points without finding an ear.",
-				"no_ear_streak",
-				no_ear_streak,
-				"remaining",
-				remaining_points,
-			)
 			return triangles, false
 		}
 	}
@@ -436,6 +439,7 @@ Optional :: struct($T: typeid) {
 
 main :: proc() {
 	context.logger = log.create_console_logger()
+
 	rl.SetConfigFlags({.WINDOW_HIGHDPI, .MSAA_4X_HINT, .VSYNC_HINT})
 	rl.InitWindow(width, height, WINDOW_TITLE)
 	rl.SetExitKey(rl.KeyboardKey.KEY_NULL) // Disable default exit key (ESC)
@@ -578,6 +582,7 @@ main :: proc() {
 			polygons_size = 0
 			current_polygon = PointList{}
 			current_triangulation = [dynamic]Triangle{}
+			is_current_triangulation_invalid = false
 		}
 
 		// Close the polygon
@@ -626,7 +631,6 @@ main :: proc() {
 					is_current_triangulation_invalid = false
 					current_triangulation = triangles
 				} else {
-					log.debug("Failed to triangulate polygon", triangles)
 					message = "Failed to triangulate polygon"
 					is_current_triangulation_invalid = true
 					current_triangulation = triangles
@@ -645,7 +649,6 @@ main :: proc() {
 					is_triangulation_invalid[i] = false
 					triangulations[i] = triangles
 				} else {
-					log.debug("Failed to triangulate polygon ", i + 1)
 					message = fmt.bprintf(
 						message_buffer[:],
 						"Failed to triangulate polygon %d",
@@ -751,10 +754,11 @@ main :: proc() {
 			for i in 0 ..< polygons_size {
 				polygon := polygons[i]
 				triangles := triangulations[i]
-				for triangle, i in triangles {
-					color := colors[i % len(colors)]
+				invalid := is_triangulation_invalid[i]
+				for triangle, j in triangles {
+					color := colors[j % len(colors)]
 					color = rl.ColorAlpha(color, 0.1)
-					if is_triangulation_invalid[i] {
+					if invalid {
 						if debug {
 							draw_line(triangle.a, triangle.b, true, LINE_COLOR_DEBUG)
 							draw_line(triangle.a, triangle.c, true, LINE_COLOR_DEBUG)
