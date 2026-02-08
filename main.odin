@@ -5,10 +5,12 @@ import "core:log"
 import "core:math"
 import "core:os"
 import "core:strings"
+import "core:sys/kqueue"
 import "vendor:glfw"
 import rl "vendor:raylib"
 
 
+WINDOW_TITLE: cstring = "Triangulation by Ear Clipping "
 LINE_COLOR: rl.Color = FG_COLOR
 LINE_THICKNESS: f32 = 1.0
 DASH_LENGTH: f32 = 5.0
@@ -22,12 +24,16 @@ BG_COLOR: rl.Color = rl.Color{0xF7, 0xF3, 0xEE, 0xFF}
 BG_COLOR_2: rl.Color = rl.Color{0xDE, 0xDA, 0xD6, 0xFF}
 PANEL_COLOR: rl.Color = rl.Color{0xDE, 0xDA, 0xD6, 0x66}
 FG_COLOR: rl.Color = rl.Color{0x60, 0x5a, 0x52, 0xFF}
+FG_ERROR_COLOR: rl.Color = rl.Color{0xFF, 0x69, 0x61, 0xFF}
 CONFIG_OPTIONS := []cstring {
 	"Toggle Pointer (P)",
 	"Close Polygon (C)",
 	"Reset (R)",
 	"Toggle Triangulation (T)",
+	"Toggle Labels (L)",
 }
+MAX_POINTS :: 1024
+MAX_POLYGONS :: 128
 
 
 Point :: struct {
@@ -66,8 +72,11 @@ FontWeight :: enum {
 	BOLD,
 }
 
-point_pool: [1000]Point
+point_pool: [MAX_POINTS]Point
 point_pool_index: int = 0
+point_free_list: [MAX_POINTS]^Point
+point_free_list_index: int = 0
+
 width: i32 = 800
 height: i32 = 600
 font_file_cache := map[string]rl.Font{}
@@ -82,6 +91,35 @@ colors := []rl.Color {
 	rl.PINK,
 	rl.LIME,
 	rl.DARKBLUE,
+}
+
+point_alloc :: proc() -> ^Point {
+	if point_free_list_index > 0 {
+		point_free_list_index -= 1
+		recycled_point := point_free_list[point_free_list_index]
+		return recycled_point
+	} else {
+		if point_pool_index >= MAX_POINTS {
+			log.error("Out of points!")
+			return nil
+		}
+		point := &point_pool[point_pool_index]
+		point_pool_index += 1
+		return point
+	}
+}
+
+point_free :: proc(point: ^Point) {
+	point_free_list[point_free_list_index] = point
+	point_free_list_index += 1
+}
+
+point_list_free :: proc(list: ^PointList) {
+	head := list.head
+	it := &head
+	for point in next_point(it) {
+		point_free(point)
+	}
 }
 
 get_font_file :: proc(weight: FontWeight) -> string {
@@ -104,6 +142,7 @@ draw_text :: proc(
 	position: rl.Vector2,
 	font_size: FontSize = FontSize.SMALL,
 	font_weight: FontWeight = FontWeight.REGULAR,
+	color: rl.Color = FG_COLOR,
 ) {
 	font_file := get_font_file(font_weight)
 	font_id := fmt.tprintf("%s-%zu", font_file, font_size)
@@ -114,7 +153,7 @@ draw_text :: proc(
 		font_file_cache[font_id] = font
 	}
 
-	rl.DrawTextEx(font, text, position, cast(f32)font_size, 0.0, FG_COLOR)
+	rl.DrawTextEx(font, text, position, cast(f32)font_size, 0.0, color)
 }
 
 measure_text :: proc(
@@ -186,8 +225,7 @@ point_list_init := proc() -> PointList {
 }
 
 point_list_append := proc(list: ^PointList, pos: rl.Vector2) {
-	new_point := &point_pool[point_pool_index]
-	point_pool_index += 1
+	new_point := point_alloc()
 	new_point^ = Point {
 		pos  = pos,
 		next = nil,
@@ -216,6 +254,7 @@ point_list_remove := proc(list: ^PointList, point: ^Point) {
 		list.tail = point.prev
 	}
 	list.size -= 1
+	point_free(point)
 }
 
 point_list_clone := proc(list: ^PointList) -> PointList {
@@ -232,7 +271,6 @@ point_list_clone := proc(list: ^PointList) -> PointList {
 }
 
 point_list_reverse :: proc(list: ^PointList) {
-	log.debug("Reversing list: ", list)
 	cursor := list.head
 	for cursor != nil {
 		next := cursor.next
@@ -242,7 +280,6 @@ point_list_reverse :: proc(list: ^PointList) {
 		cursor = next
 	}
 	list.head, list.tail = list.tail, list.head
-	log.debug("Reversed list: ", list)
 }
 
 next_point :: proc(point: ^^Point) -> (^Point, bool) {
@@ -375,25 +412,30 @@ polygon_area :: proc(polygon: ^PointList) -> f32 {
 	return area * 0.5
 }
 
+Optional :: struct($T: typeid) {
+	value:     $T,
+	has_value: bool,
+}
+
 main :: proc() {
 	context.logger = log.create_console_logger()
 	rl.SetConfigFlags({.WINDOW_HIGHDPI, .MSAA_4X_HINT, .VSYNC_HINT})
-	rl.InitWindow(width, height, "Ear Clipping Triangulation")
+	rl.InitWindow(width, height, WINDOW_TITLE)
 	rl.SetExitKey(rl.KeyboardKey.KEY_NULL) // Disable default exit key (ESC)
 	rl.SetTargetFPS(120)
 
-	polygons := [100]PointList{}
+	triangulations := [MAX_POLYGONS][dynamic]Triangle{}
+	polygons := [MAX_POLYGONS]PointList{}
 	polygons_size := 0
 	current_polygon := PointList {
 		size = 0,
 		head = nil,
 		tail = nil,
 	}
-	pointer := true
-
+	current_triangles := [dynamic]Triangle{}
 	dragging_point_ref := PointRef{}
-
-	triangles := [dynamic]Triangle{}
+	triangulate := true
+	show_labels := true
 
 	for !rl.WindowShouldClose() {
 		rl.BeginDrawing()
@@ -403,13 +445,13 @@ main :: proc() {
 		mouse_pos := rl.GetMousePosition()
 		mouse_pos.x = math.clamp(mouse_pos.x, 0, cast(f32)width - POINT_OUTER_RADIUS)
 		mouse_pos.y = math.clamp(mouse_pos.y, 0, cast(f32)height - POINT_OUTER_RADIUS)
-		is_mouse_clicked := rl.IsMouseButtonPressed(rl.MouseButton.LEFT)
-
 		hovered_point_ref := PointRef{}
+		is_selecting := false
+		message: cstring = nil
 
+		// Calculate key bindings panel size
 		panel_font_size := FontSize.SMALL
 		panel_font_weight := FontWeight.REGULAR
-
 		max_text_width: f32 = 0
 		total_text_height: f32 = 0
 		for text in CONFIG_OPTIONS {
@@ -417,7 +459,6 @@ main :: proc() {
 			max_text_width = math.max(max_text_width, measurement.x)
 			total_text_height += measurement.y
 		}
-
 		key_bindings_panel := rl.Rectangle {
 			x      = 5,
 			y      = 5,
@@ -425,7 +466,19 @@ main :: proc() {
 			height = total_text_height + 10,
 		}
 
-		// Hovering and dragging
+		// Hovering
+		// Check collision with current_polygon
+		it := current_polygon.head
+		for point in next_point(&it) {
+			if rl.CheckCollisionPointCircle(mouse_pos, point.pos, POINT_HOVER_CIRCLE) {
+				hovered_point_ref = PointRef {
+					list  = &current_polygon,
+					point = point,
+				}
+				break
+			}
+		}
+		// Check collision with other polygons
 		for i in 0 ..< polygons_size {
 			polygon := &polygons[i]
 			it := polygon.head
@@ -439,19 +492,25 @@ main :: proc() {
 				}
 			}
 		}
-		{
-			it := current_polygon.head
-			for point in next_point(&it) {
-				if rl.CheckCollisionPointCircle(mouse_pos, point.pos, POINT_HOVER_CIRCLE) {
-					hovered_point_ref = PointRef {
-						list  = &current_polygon,
-						point = point,
-					}
-					break
-				}
+
+		// Dragging
+		// Set dragging point
+		if hovered_point_ref.point != nil &&
+		   !(hovered_point_ref.point == current_polygon.head) &&
+		   dragging_point_ref.point == nil &&
+		   rl.IsMouseButtonDown(rl.MouseButton.LEFT) {
+			dragging_point_ref = hovered_point_ref
+		}
+		if dragging_point_ref.point != nil && !rl.IsMouseButtonDown(rl.MouseButton.LEFT) {
+			dragging_point_ref = PointRef{}
+		}
+		if dragging_point_ref.point != nil {
+			if dragging_point_ref.point != current_polygon.head {
+				dragging_point_ref.point.pos = mouse_pos
 			}
 		}
 
+		// Right click to remove point
 		if rl.IsMouseButtonPressed(rl.MouseButton.RIGHT) {
 			if hovered_point_ref.point != nil {
 				if hovered_point_ref.list.size > 3 {
@@ -464,36 +523,21 @@ main :: proc() {
 			}
 		}
 
+		// Set mouse cursor
 		rl.SetMouseCursor(.DEFAULT)
-
 		if hovered_point_ref.point != nil {
 			rl.SetMouseCursor(rl.MouseCursor.POINTING_HAND)
 		}
-
 		if dragging_point_ref.point != nil {
 			rl.SetMouseCursor(rl.MouseCursor.RESIZE_ALL)
 		}
-
-		if hovered_point_ref.point != nil &&
-		   !(hovered_point_ref.point == current_polygon.head) &&
-		   dragging_point_ref.point == nil &&
-		   rl.IsMouseButtonDown(rl.MouseButton.LEFT) {
-			dragging_point_ref = hovered_point_ref
+		if is_selecting {
+			rl.SetMouseCursor(rl.MouseCursor.CROSSHAIR)
 		}
 
-		if dragging_point_ref.point != nil && !rl.IsMouseButtonDown(rl.MouseButton.LEFT) {
-			dragging_point_ref = PointRef{}
-		}
-
-		if dragging_point_ref.point != nil {
-			if dragging_point_ref.point != current_polygon.head {
-				dragging_point_ref.point.pos = mouse_pos
-			}
-		}
-
-		if pointer && dragging_point_ref.point == nil {
-			// Handle mouse input
-			if is_mouse_clicked {
+		// Create new point
+		if dragging_point_ref.point == nil {
+			if rl.IsMouseButtonPressed(rl.MouseButton.LEFT) {
 				if current_polygon.size >= 3 && hovered_point_ref.point == current_polygon.head {
 					polygons[polygons_size] = current_polygon
 					polygons_size += 1
@@ -504,13 +548,16 @@ main :: proc() {
 			}
 		}
 
-		// Handle keys
-
 		// Reset
 		if rl.IsKeyPressed(rl.KeyboardKey.R) {
-			triangles = [dynamic]Triangle{}
+			triangulations = [MAX_POLYGONS][dynamic]Triangle{}
+			for i in 0 ..< polygons_size {
+				point_list_free(&polygons[i])
+			}
 			polygons_size = 0
+
 			current_polygon = PointList{}
+			current_triangles = [dynamic]Triangle{}
 		}
 
 		// Close the polygon
@@ -522,11 +569,6 @@ main :: proc() {
 			}
 		}
 
-		// Close the polygon
-		if rl.IsKeyPressed(rl.KeyboardKey.P) {
-			pointer = !pointer
-		}
-
 		// Toggle show triangles
 		if rl.IsKeyPressed(rl.KeyboardKey.T) {
 		}
@@ -536,31 +578,58 @@ main :: proc() {
 			current_polygon = PointList{}
 		}
 
+		// Triangulate
 		if rl.IsKeyPressed(rl.KeyboardKey.T) {
-			if len(triangles) != 0 {
-				triangles = [dynamic]Triangle{}
-			} else {
-				if polygons_size > 0 {
-					target_polygon := point_list_clone(&polygons[0])
-					found: bool
-					triangles, found = ear_clipping(&target_polygon)
-					if !found {
-						log.debug("Failed to triangulate polygon, trying reverse")
-						point_list_reverse(&target_polygon)
-						triangles, found = ear_clipping(&target_polygon)
-					}
+			triangulate = !triangulate
+		}
 
-					if found {
-						log.debug("Found triangulation")
-					} else {
-						log.debug("Failed to triangulate polygon")
-					}
+		// Triangulate
+		if rl.IsKeyPressed(rl.KeyboardKey.L) {
+			show_labels = !show_labels
+		}
+
+		if triangulate {
+			if current_polygon.size >= 3 {
+				temporary_polygon := point_list_clone(&current_polygon)
+				if dragging_point_ref.point == nil && hovered_point_ref.point == nil {
+					point_list_append(&temporary_polygon, mouse_pos)
 				}
+
+				triangles, found := ear_clipping(&temporary_polygon)
+				if found {
+					current_triangles = triangles
+					message = nil
+				} else {
+					log.debug("Failed to triangulate polygon")
+					message = "Failed to triangulate polygon"
+					current_triangles = [dynamic]Triangle{}
+				}
+				point_list_free(&temporary_polygon)
+			} else {
+				current_triangles = [dynamic]Triangle{}
+			}
+
+			for i in 0 ..< polygons_size {
+				polygon := &polygons[i]
+				temporary_polygon := point_list_clone(polygon)
+				triangles, found := ear_clipping(&temporary_polygon)
+				if found {
+					triangulations[i] = triangles
+					message = nil
+				} else {
+					log.debug("Failed to triangulate polygon")
+					message = "Failed to triangulate polygon"
+					triangulations[i] = [dynamic]Triangle{}
+				}
+
+				point_list_free(&temporary_polygon)
 			}
 		}
 
+		// Drawing
+
 		// Draw mouse point
-		if pointer && dragging_point_ref.point == nil {
+		if dragging_point_ref.point == nil && !is_selecting {
 			if current_polygon.size > 0 {
 				draw_line(current_polygon.tail.pos, mouse_pos, true)
 			}
@@ -570,19 +639,28 @@ main :: proc() {
 		}
 
 		// Draw current polygon
-		it: ^Point = current_polygon.head
+		it = current_polygon.head
 		for point in next_point(&it) {
 			if point != current_polygon.head {
 				draw_line(point.prev.pos, point.pos)
 			}
 		}
 		it = current_polygon.head
+		i := 0
 		for point in next_point(&it) {
 			if hovered_point_ref.point == point {
 				draw_point(point.pos, true)
 			} else {
 				draw_point(point.pos)
 			}
+			if show_labels {
+				label_text := rl.TextFormat("%d", i)
+				draw_text(
+					label_text,
+					rl.Vector2{point.pos.x + POINT_OUTER_RADIUS + 1, point.pos.y},
+				)
+			}
+			i += 1
 		}
 
 		// Draw existing polygons
@@ -598,23 +676,46 @@ main :: proc() {
 				}
 			}
 			it = polygon.head
+			i := 0
 			for point in next_point(&it) {
 				if hovered_point_ref.point == point {
 					draw_point(point.pos, true)
 				} else {
 					draw_point(point.pos)
 				}
+				if show_labels {
+					label_text := rl.TextFormat("%d", i)
+					draw_text(
+						label_text,
+						rl.Vector2{point.pos.x + POINT_OUTER_RADIUS + 1, point.pos.y},
+					)
+				}
+				i += 1
 			}
 		}
 
 		// Draw triangles
-		for triangle, i in triangles {
-			color := colors[i % len(colors)]
-			color = rl.ColorAlpha(color, 0.1)
-			draw_line(triangle.a, triangle.b)
-			draw_line(triangle.a, triangle.c)
-			draw_line(triangle.b, triangle.c)
-			rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
+		if triangulate {
+			for triangle, i in current_triangles {
+				color := colors[i % len(colors)]
+				color = rl.ColorAlpha(color, 0.1)
+				draw_line(triangle.a, triangle.b)
+				draw_line(triangle.a, triangle.c)
+				draw_line(triangle.b, triangle.c)
+				rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
+			}
+
+			for i in 0 ..< polygons_size {
+				triangles := triangulations[i]
+				for triangle, i in triangles {
+					color := colors[i % len(colors)]
+					color = rl.ColorAlpha(color, 0.1)
+					draw_line(triangle.a, triangle.b)
+					draw_line(triangle.a, triangle.c)
+					draw_line(triangle.b, triangle.c)
+					rl.DrawTriangle(triangle.c, triangle.b, triangle.a, color)
+				}
+			}
 		}
 
 		// Draw key bindings panel
@@ -662,6 +763,18 @@ main :: proc() {
 				cast(f32)width - points_text_width - padding,
 				cast(f32)height - cast(f32)FontSize.SMALL * 2,
 			},
+		)
+
+		message_width := measure_text(message).x
+		draw_text(
+			message,
+			rl.Vector2 {
+				(cast(f32)width - message_width) / 2,
+				cast(f32)height - cast(f32)FontSize.SMALL * 2,
+			},
+			FontSize.SMALL,
+			FontWeight.BOLD,
+			FG_ERROR_COLOR,
 		)
 	}
 
