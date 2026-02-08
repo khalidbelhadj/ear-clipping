@@ -26,7 +26,6 @@ PANEL_COLOR: rl.Color = rl.Color{0xDE, 0xDA, 0xD6, 0x66}
 FG_COLOR: rl.Color = rl.Color{0x60, 0x5a, 0x52, 0xFF}
 FG_ERROR_COLOR: rl.Color = rl.Color{0xFF, 0x69, 0x61, 0xFF}
 CONFIG_OPTIONS := []cstring {
-	"Toggle Pointer (P)",
 	"Close Polygon (C)",
 	"Reset (R)",
 	"Toggle Triangulation (T)",
